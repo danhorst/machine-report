@@ -243,8 +243,17 @@ net_hostname=$(scutil --get LocalHostName 2>/dev/null || hostname -f 2>/dev/null
 if [ -z "$net_hostname" ]; then net_hostname="Not Defined"; fi
 
 net_machine_ip=$(get_ip_addr)
-net_client_ip=$(who am i | awk '{print $5}' | tr -d '()')
-if [ -z "$net_client_ip" ]; then
+# Get client IP: prefer SSH env vars, then parse who am i
+if [ -n "$SSH_CLIENT" ]; then
+    net_client_ip=$(echo "$SSH_CLIENT" | awk '{print $1}')
+elif [ -n "$SSH_CONNECTION" ]; then
+    net_client_ip=$(echo "$SSH_CONNECTION" | awk '{print $1}')
+else
+    # Parse who am i - look for field in parentheses containing IP or hostname
+    net_client_ip=$(who am i 2>/dev/null | grep -oE '\([^)]+\)' | tr -d '()')
+fi
+# Validate: must look like IP or hostname, not a time (HH:MM)
+if [ -z "$net_client_ip" ] || [[ "$net_client_ip" =~ ^[0-9]+:[0-9]+$ ]]; then
     net_client_ip="Not connected"
 fi
 net_dns_ip=($(scutil --dns 2>/dev/null | grep 'nameserver\[' | awk '{print $3}' | sort -u))
