@@ -195,25 +195,43 @@ get_ip_addr() {
     ipv4_address=""
     ipv6_address=""
 
-    # macOS: use ifconfig (ip command is not available by default)
     if command -v ifconfig &> /dev/null; then
-        # Try to get IPv4 address using ifconfig
-        # macOS ifconfig format: interface names don't have colons, inet line has "inet X.X.X.X"
-        ipv4_address=$(ifconfig | awk '
-            /^[a-z]/ {iface=$1}
-            iface != "lo0" && iface != "lo0:" && iface !~ /^docker/ && iface !~ /^utun/ && /inet / && !/127\.0\.0\.1/ && !found_ipv4 {found_ipv4=1; print $2}')
-
-        # If IPv4 address not available, try IPv6 using ifconfig
-        if [ -z "$ipv4_address" ]; then
-            ipv6_address=$(ifconfig | awk '
+        if [[ "$OSTYPE" == "darwin"* ]]; then
+            # macOS ifconfig format: interface names don't have colons
+            ipv4_address=$(ifconfig | awk '
                 /^[a-z]/ {iface=$1}
-                iface != "lo0" && iface != "lo0:" && iface !~ /^docker/ && iface !~ /^utun/ && /inet6 / && !/::1/ && !/fe80:/ && !found_ipv6 {found_ipv6=1; print $2}')
+                iface != "lo0" && iface != "lo0:" && iface !~ /^docker/ && iface !~ /^utun/ && /inet / && !/127\.0\.0\.1/ && !found_ipv4 {found_ipv4=1; print $2}')
+
+            if [ -z "$ipv4_address" ]; then
+                ipv6_address=$(ifconfig | awk '
+                    /^[a-z]/ {iface=$1}
+                    iface != "lo0" && iface != "lo0:" && iface !~ /^docker/ && iface !~ /^utun/ && /inet6 / && !/::1/ && !/fe80:/ && !found_ipv6 {found_ipv6=1; print $2}')
+            fi
+        else
+            # Linux ifconfig format: interface names have colons
+            ipv4_address=$(ifconfig | awk '
+                /^[a-z]/ {iface=$1}
+                iface != "lo:" && iface !~ /^docker/ && /inet / && !found_ipv4 {found_ipv4=1; print $2}')
+
+            if [ -z "$ipv4_address" ]; then
+                ipv6_address=$(ifconfig | awk '
+                    /^[a-z]/ {iface=$1}
+                    iface != "lo:" && iface !~ /^docker/ && /inet6 / && !found_ipv6 {found_ipv6=1; print $2}')
+            fi
+        fi
+    elif command -v ip &> /dev/null; then
+        # Linux: use ip command as fallback
+        ipv4_address=$(ip -o -4 addr show | awk '
+            $2 != "lo" && $2 !~ /^docker/ {split($4, a, "/"); if (!found_ipv4++) print a[1]}')
+
+        if [ -z "$ipv4_address" ]; then
+            ipv6_address=$(ip -o -6 addr show | awk '
+                $2 != "lo" && $2 !~ /^docker/ {split($4, a, "/"); if (!found_ipv6++) print a[1]}')
         fi
     fi
 
-    # Fallback: try ipconfig getifaddr for macOS
-    if [ -z "$ipv4_address" ] && [ -z "$ipv6_address" ]; then
-        # Try common macOS interfaces
+    # macOS fallback: try ipconfig getifaddr
+    if [ -z "$ipv4_address" ] && [ -z "$ipv6_address" ] && [[ "$OSTYPE" == "darwin"* ]]; then
         for iface in en0 en1 en2 en3; do
             ipv4_address=$(ipconfig getifaddr "$iface" 2>/dev/null)
             if [ -n "$ipv4_address" ]; then
@@ -234,12 +252,26 @@ get_ip_addr() {
 }
 
 # Operating System Information
-os_name="macOS $(sw_vers -productVersion) $(sw_vers -buildVersion)"
+if [[ "$OSTYPE" == "darwin"* ]]; then
+    os_name="macOS $(sw_vers -productVersion) $(sw_vers -buildVersion)"
+else
+    # shellcheck source=/dev/null
+    source /etc/os-release
+    os_name="${ID^} ${VERSION} ${VERSION_CODENAME^}"
+fi
 os_kernel=$({ uname; uname -r; } | tr '\n' ' ')
 
 # Network Information
 net_current_user=$(whoami)
-net_hostname=$(scutil --get LocalHostName 2>/dev/null || hostname -f 2>/dev/null || uname -n)
+if [[ "$OSTYPE" == "darwin"* ]]; then
+    net_hostname=$(scutil --get LocalHostName 2>/dev/null || hostname -f 2>/dev/null || uname -n)
+else
+    if command -v hostname &>/dev/null; then
+        net_hostname=$(hostname -f 2>/dev/null || uname -n)
+    else
+        net_hostname=$(grep -w "$(uname -n)" /etc/hosts | awk '{print $2}' | head -n 1)
+    fi
+fi
 if [ -z "$net_hostname" ]; then net_hostname="Not Defined"; fi
 
 net_machine_ip=$(get_ip_addr)
@@ -256,48 +288,69 @@ fi
 if [ -z "$net_client_ip" ] || [[ "$net_client_ip" =~ ^[0-9]+:[0-9]+$ ]]; then
     net_client_ip="Not connected"
 fi
-net_dns_ip=($(scutil --dns 2>/dev/null | grep 'nameserver\[' | awk '{print $3}' | sort -u))
+
+# DNS servers
+if [[ "$OSTYPE" == "darwin"* ]]; then
+    net_dns_ip=($(scutil --dns 2>/dev/null | grep 'nameserver\[' | awk '{print $3}' | sort -u))
+else
+    net_dns_ip=($(grep '^nameserver [0-9.]' /etc/resolv.conf | awk '{print $2}'))
+fi
 
 # CPU Information
-cpu_model="$(sysctl -n machdep.cpu.brand_string 2>/dev/null | awk '{print $1, $2, $3, $4}')"
-if [ -z "$cpu_model" ]; then
-    # Apple Silicon doesn't have brand_string, use chip info
-    cpu_model="$(sysctl -n machdep.cpu.brand 2>/dev/null)"
+if [[ "$OSTYPE" == "darwin"* ]]; then
+    cpu_model="$(sysctl -n machdep.cpu.brand_string 2>/dev/null | awk '{print $1, $2, $3, $4}')"
     if [ -z "$cpu_model" ]; then
-        cpu_model="Apple $(uname -m)"
+        # Apple Silicon doesn't have brand_string, use chip info
+        cpu_model="$(sysctl -n machdep.cpu.brand 2>/dev/null)"
+        if [ -z "$cpu_model" ]; then
+            cpu_model="Apple $(uname -m)"
+        fi
     fi
-fi
 
-# Check if running in a VM
-if sysctl -n machdep.cpu.features 2>/dev/null | grep -q "VMM"; then
-    cpu_hypervisor="Virtual Machine"
-elif system_profiler SPHardwareDataType 2>/dev/null | grep -q "Virtual"; then
-    cpu_hypervisor="Virtual Machine"
-else
-    cpu_hypervisor="Bare Metal"
-fi
-
-cpu_cores="$(sysctl -n hw.ncpu)"
-cpu_cores_per_socket="$(sysctl -n hw.physicalcpu 2>/dev/null || echo "$cpu_cores")"
-cpu_sockets="1"
-# Get CPU frequency in GHz
-cpu_freq_hz="$(sysctl -n hw.cpufrequency 2>/dev/null)"
-if [ -n "$cpu_freq_hz" ] && [ "$cpu_freq_hz" -gt 0 ]; then
-    # Intel Mac or frequency available via sysctl
-    cpu_freq=$(awk -v freq="$cpu_freq_hz" 'BEGIN { printf "%.2f", freq / 1000000000 }')
-else
-    # Apple Silicon: frequency not exposed via sysctl, use known P-core max frequencies
-    chip_name=$(sysctl -n machdep.cpu.brand_string 2>/dev/null)
-    if [ -z "$chip_name" ]; then
-        chip_name=$(system_profiler SPHardwareDataType 2>/dev/null | awk -F': ' '/Chip/ {print $2}')
+    # Check if running in a VM
+    if sysctl -n machdep.cpu.features 2>/dev/null | grep -q "VMM"; then
+        cpu_hypervisor="Virtual Machine"
+    elif system_profiler SPHardwareDataType 2>/dev/null | grep -q "Virtual"; then
+        cpu_hypervisor="Virtual Machine"
+    else
+        cpu_hypervisor="Bare Metal"
     fi
-    case "$chip_name" in
-        *"M1"*)           cpu_freq="3.20" ;;  # M1/M1 Pro/M1 Max P-cores
-        *"M2"*)           cpu_freq="3.50" ;;  # M2 family P-cores
-        *"M3"*)           cpu_freq="4.05" ;;  # M3 family P-cores
-        *"M4"*)           cpu_freq="4.40" ;;  # M4 family P-cores
-        *)                cpu_freq="N/A" ;;
-    esac
+
+    cpu_cores="$(sysctl -n hw.ncpu)"
+    cpu_cores_per_socket="$(sysctl -n hw.physicalcpu 2>/dev/null || echo "$cpu_cores")"
+    cpu_sockets="1"
+
+    # Get CPU frequency in GHz
+    cpu_freq_hz="$(sysctl -n hw.cpufrequency 2>/dev/null)"
+    if [ -n "$cpu_freq_hz" ] && [ "$cpu_freq_hz" -gt 0 ]; then
+        cpu_freq=$(awk -v freq="$cpu_freq_hz" 'BEGIN { printf "%.2f", freq / 1000000000 }')
+    else
+        # Apple Silicon: frequency not exposed via sysctl
+        # NOTE: These are approximate P-core max frequencies; update as new chips release
+        chip_name=$(sysctl -n machdep.cpu.brand_string 2>/dev/null)
+        if [ -z "$chip_name" ]; then
+            chip_name=$(system_profiler SPHardwareDataType 2>/dev/null | awk -F': ' '/Chip/ {print $2}')
+        fi
+        case "$chip_name" in
+            *"M1"*)           cpu_freq="3.20" ;;
+            *"M2"*)           cpu_freq="3.50" ;;
+            *"M3"*)           cpu_freq="4.05" ;;
+            *"M4"*)           cpu_freq="4.40" ;;
+            *)                cpu_freq="N/A" ;;
+        esac
+    fi
+else
+    # Linux
+    cpu_model="$(lscpu | grep 'Model name' | grep -v 'BIOS' | cut -f 2 -d ':' | awk '{print $1 " "  $2 " " $3 " " $4}')"
+    cpu_hypervisor="$(lscpu | grep 'Hypervisor vendor' | cut -f 2 -d ':' | awk '{$1=$1}1')"
+    if [ -z "$cpu_hypervisor" ]; then
+        cpu_hypervisor="Bare Metal"
+    fi
+
+    cpu_cores="$(nproc --all)"
+    cpu_cores_per_socket="$(lscpu | grep 'Core(s) per socket' | cut -f 2 -d ':'| awk '{$1=$1}1')"
+    cpu_sockets="$(lscpu | grep 'Socket(s)' | cut -f 2 -d ':' | awk '{$1=$1}1')"
+    cpu_freq="$(grep 'cpu MHz' /proc/cpuinfo | cut -f 2 -d ':' | awk 'NR==1 { printf "%.2f", $1 / 1000 }')"
 fi
 
 # macOS uses "load averages:" (plural), Linux uses "load average:" (singular)
@@ -306,22 +359,29 @@ load_avg_5min=$(uptime | awk -F'load averages?: ' '{print $2}' | cut -d ',' -f2 
 load_avg_15min=$(uptime | awk -F'load averages?: ' '{print $2}' | cut -d ',' -f3 | tr -d ' ')
 
 # Memory Information
-mem_total_bytes=$(sysctl -n hw.memsize)
-mem_total=$((mem_total_bytes / 1024))  # Convert to KB for consistency
+if [[ "$OSTYPE" == "darwin"* ]]; then
+    mem_total_bytes=$(sysctl -n hw.memsize)
+    mem_total=$((mem_total_bytes / 1024))  # Convert to KB for consistency
 
-# Get memory usage from vm_stat (values are in pages)
-# macOS memory model: Used = wired + active + inactive + speculative + occupied by compressor
-# This matches what Activity Monitor reports as "Memory Used"
-page_size=$(vm_stat | head -1 | awk -F'page size of ' '{print $2}' | awk '{print $1}')
-vm_stats=$(vm_stat)
-pages_free=$(echo "$vm_stats" | awk '/Pages free:/ {gsub(/\./,"",$3); print $3}')
+    # Get memory usage from vm_stat (values are in pages)
+    page_size=$(vm_stat | head -1 | awk -F'page size of ' '{print $2}' | awk '{print $1}')
+    vm_stats=$(vm_stat)
+    pages_free=$(echo "$vm_stats" | awk '/Pages free:/ {gsub(/\./,"",$3); print $3}')
+    pages_inactive=$(echo "$vm_stats" | awk '/Pages inactive:/ {gsub(/\./,"",$3); print $3}')
+    pages_purgeable=$(echo "$vm_stats" | awk '/Pages purgeable:/ {gsub(/\./,"",$3); print $3}')
 
-# Calculate used memory: Total - (free pages only)
-# This matches Activity Monitor's "used" reporting
-mem_free_bytes=$((pages_free * page_size))
-mem_used_bytes=$((mem_total_bytes - mem_free_bytes))
-mem_used=$((mem_used_bytes / 1024))  # Convert to KB
-mem_available=$((mem_free_bytes / 1024))  # Convert to KB
+    # Available = free + inactive + purgeable (memory that can be reclaimed)
+    mem_available_pages=$((pages_free + pages_inactive + pages_purgeable))
+    mem_available_bytes=$((mem_available_pages * page_size))
+    mem_used_bytes=$((mem_total_bytes - mem_available_bytes))
+    mem_used=$((mem_used_bytes / 1024))  # Convert to KB
+    mem_available=$((mem_available_bytes / 1024))  # Convert to KB
+else
+    # Linux
+    mem_total=$(grep 'MemTotal' /proc/meminfo | awk '{print $2}')
+    mem_available=$(grep 'MemAvailable' /proc/meminfo | awk '{print $2}')
+    mem_used=$((mem_total - mem_available))
+fi
 
 mem_percent=$(awk -v used="$mem_used" -v total="$mem_total" 'BEGIN { printf "%.2f", (used / total) * 100 }')
 mem_percent=$(printf "%.2f" "$mem_percent")
@@ -330,8 +390,22 @@ mem_available_gb=$(echo "$mem_available" | awk '{ printf "%.2f", $1 / (1024 * 10
 mem_used_gb=$(echo "$mem_used" | awk '{ printf "%.2f", $1 / (1024 * 1024) }')
 
 # Disk Information
-# macOS uses APFS by default; ZFS is rare but possible via OpenZFS
-if command -v zpool &>/dev/null && zpool list &>/dev/null 2>&1; then
+# Check for ZFS first (works on both Linux and macOS with OpenZFS)
+if [[ "$OSTYPE" != "darwin"* ]] && command -v zfs &>/dev/null && grep -q "zfs" /proc/mounts 2>/dev/null; then
+    # Linux ZFS
+    zfs_present=1
+    zfs_health=$(zpool status -x zroot | grep -q "is healthy" && echo "HEALTH O.K." || echo "N/A")
+    zfs_available=$(zfs get -o value -Hp available "$zfs_filesystem" 2>/dev/null)
+    zfs_used=$(zfs get -o value -Hp used "$zfs_filesystem" 2>/dev/null)
+    if [ -n "$zfs_available" ] && [ -n "$zfs_used" ]; then
+        zfs_available_gb=$(echo "$zfs_available" | awk '{ printf "%.2f", $1 / (1024 * 1024 * 1024) }')
+        zfs_used_gb=$(echo "$zfs_used" | awk '{ printf "%.2f", $1 / (1024 * 1024 * 1024) }')
+        disk_percent=$(awk -v used="$zfs_used" -v available="$zfs_available" 'BEGIN { printf "%.2f", (used / available) * 100 }')
+    else
+        zfs_present=0
+    fi
+elif command -v zpool &>/dev/null && zpool list &>/dev/null 2>&1; then
+    # macOS ZFS (OpenZFS)
     zfs_present=1
     zfs_health=$(zpool status -x zroot 2>/dev/null | grep -q "is healthy" && echo "HEALTH O.K." || echo "N/A")
     zfs_available=$(zfs get -o value -Hp available "$zfs_filesystem" 2>/dev/null)
@@ -346,72 +420,94 @@ if command -v zpool &>/dev/null && zpool list &>/dev/null 2>&1; then
 fi
 
 if [ "$zfs_present" -eq 0 ]; then
-    # macOS APFS: use diskutil to get container-level info (matches Finder)
-    if command -v diskutil &>/dev/null; then
-        container_total=$(diskutil info / 2>/dev/null | awk -F': *' '/Container Total Space/ {print $2}' | awk '{print $1}')
-        container_free=$(diskutil info / 2>/dev/null | awk -F': *' '/Container Free Space/ {print $2}' | awk '{print $1}')
-    fi
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        # macOS APFS: use diskutil to get container-level info (matches Finder)
+        if command -v diskutil &>/dev/null; then
+            container_total=$(diskutil info / 2>/dev/null | awk -F': *' '/Container Total Space/ {print $2}' | awk '{print $1}')
+            container_free=$(diskutil info / 2>/dev/null | awk -F': *' '/Container Free Space/ {print $2}' | awk '{print $1}')
+        fi
 
-    if [ -n "$container_total" ] && [ -n "$container_free" ]; then
-        # Use APFS container info (matches Finder display)
-        root_total_gb="$container_total"
-        root_available_gb="$container_free"
-        root_used_gb=$(awk -v total="$root_total_gb" -v avail="$root_available_gb" 'BEGIN { printf "%.2f", total - avail }')
-        disk_percent=$(awk -v used="$root_used_gb" -v total="$root_total_gb" 'BEGIN { printf "%.2f", (used / total) * 100 }')
-        # Convert to KB for bar graph calculation
-        root_used=$(awk -v gb="$root_used_gb" 'BEGIN { printf "%.0f", gb * 1024 * 1024 }')
-        root_total=$(awk -v gb="$root_total_gb" 'BEGIN { printf "%.0f", gb * 1024 * 1024 }')
+        if [ -n "$container_total" ] && [ -n "$container_free" ]; then
+            root_total_gb="$container_total"
+            root_available_gb="$container_free"
+            root_used_gb=$(awk -v total="$root_total_gb" -v avail="$root_available_gb" 'BEGIN { printf "%.2f", total - avail }')
+            disk_percent=$(awk -v used="$root_used_gb" -v total="$root_total_gb" 'BEGIN { printf "%.2f", (used / total) * 100 }')
+            # Convert to KB for bar graph calculation
+            root_used=$(awk -v gb="$root_used_gb" 'BEGIN { printf "%.0f", gb * 1024 * 1024 }')
+            root_total=$(awk -v gb="$root_total_gb" 'BEGIN { printf "%.0f", gb * 1024 * 1024 }')
+        else
+            # Fallback: standard df for non-APFS macOS
+            root_partition="/"
+            root_used=$(df -k "$root_partition" | awk 'NR==2 {print $3}')
+            root_available=$(df -k "$root_partition" | awk 'NR==2 {print $4}')
+            root_total=$((root_used + root_available))
+            root_total_gb=$(awk -v total="$root_total" 'BEGIN { printf "%.2f", total / (1024 * 1024) }')
+            root_used_gb=$(awk -v used="$root_used" 'BEGIN { printf "%.2f", used / (1024 * 1024) }')
+            disk_percent=$(awk -v used="$root_used" -v total="$root_total" 'BEGIN { printf "%.2f", (used / total) * 100 }')
+        fi
     else
-        # Fallback: standard df (for non-APFS or Linux)
+        # Linux: use df
         root_partition="/"
-        root_used=$(df -k "$root_partition" | awk 'NR==2 {print $3}')
-        root_available=$(df -k "$root_partition" | awk 'NR==2 {print $4}')
-        root_total=$((root_used + root_available))
-        root_total_gb=$(awk -v total="$root_total" 'BEGIN { printf "%.2f", total / (1024 * 1024) }')
-        root_used_gb=$(awk -v used="$root_used" 'BEGIN { printf "%.2f", used / (1024 * 1024) }')
+        root_used=$(df -m "$root_partition" | awk 'NR==2 {print $3}')
+        root_total=$(df -m "$root_partition" | awk 'NR==2 {print $2}')
+        root_total_gb=$(awk -v total="$root_total" 'BEGIN { printf "%.2f", total / 1024 }')
+        root_used_gb=$(awk -v used="$root_used" 'BEGIN { printf "%.2f", used / 1024 }')
         disk_percent=$(awk -v used="$root_used" -v total="$root_total" 'BEGIN { printf "%.2f", (used / total) * 100 }')
     fi
 fi
 
 # Last login and Uptime
-# macOS uses 'last' command instead of 'lastlog'
-last_login=$(last -1 "$USER" 2>/dev/null | head -1)
-if [ -n "$last_login" ] && ! echo "$last_login" | grep -q "^$"; then
-    # Parse last output: user tty host date time - end
-    last_login_host=$(echo "$last_login" | awk '{print $3}')
+if [[ "$OSTYPE" == "darwin"* ]]; then
+    # macOS uses 'last' command
+    last_login=$(last -1 "$USER" 2>/dev/null | head -1)
+    if [ -n "$last_login" ] && ! echo "$last_login" | grep -q "^$"; then
+        last_login_host=$(echo "$last_login" | awk '{print $3}')
+        if [[ "$last_login_host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            last_login_ip_present=1
+            last_login_ip="$last_login_host"
+            last_login_time=$(echo "$last_login" | awk '{print $4, $5, $6, $7}')
+        else
+            last_login_time=$(echo "$last_login" | awk '{print $3, $4, $5, $6}')
+        fi
+    else
+        last_login_time="Never logged in"
+    fi
 
-    # Check if host field is an IP address
-    if [[ "$last_login_host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    # macOS uptime doesn't support -p flag, parse standard output
+    uptime_raw=$(uptime)
+    if echo "$uptime_raw" | grep -q "day"; then
+        days=$(echo "$uptime_raw" | sed -E 's/.*up ([0-9]+) day.*/\1/')
+        hours=$(echo "$uptime_raw" | sed -E 's/.*day[s]?, +([0-9]+):([0-9]+).*/\1/')
+        mins=$(echo "$uptime_raw" | sed -E 's/.*day[s]?, +([0-9]+):([0-9]+).*/\2/')
+        sys_uptime="${days}d ${hours}h ${mins}m"
+    else
+        if echo "$uptime_raw" | grep -qE 'up +[0-9]+:[0-9]+'; then
+            hours=$(echo "$uptime_raw" | sed -E 's/.*up +([0-9]+):([0-9]+).*/\1/')
+            mins=$(echo "$uptime_raw" | sed -E 's/.*up +([0-9]+):([0-9]+).*/\2/')
+            sys_uptime="${hours}h ${mins}m"
+        elif echo "$uptime_raw" | grep -qE 'up +[0-9]+ min'; then
+            mins=$(echo "$uptime_raw" | sed -E 's/.*up +([0-9]+) min.*/\1/')
+            sys_uptime="${mins}m"
+        else
+            sys_uptime=$(echo "$uptime_raw" | sed -E 's/.*up +([^,]+),.*/\1/')
+        fi
+    fi
+else
+    # Linux uses 'lastlog' command
+    last_login=$(lastlog -u "$USER")
+    last_login_ip=$(echo "$last_login" | awk 'NR==2 {print $3}')
+
+    if [[ "$last_login_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
         last_login_ip_present=1
-        last_login_ip="$last_login_host"
-        last_login_time=$(echo "$last_login" | awk '{print $4, $5, $6, $7}')
+        last_login_time=$(echo "$last_login" | awk 'NR==2 {print $6, $7, $10, $8}')
     else
-        last_login_time=$(echo "$last_login" | awk '{print $3, $4, $5, $6}')
+        last_login_time=$(echo "$last_login" | awk 'NR==2 {print $4, $5, $8, $6}')
+        if [ "$last_login_time" = "in**" ]; then
+            last_login_time="Never logged in"
+        fi
     fi
-else
-    last_login_time="Never logged in"
-fi
 
-# macOS uptime doesn't support -p flag, parse standard output
-# Format: "HH:MM  up X days, HH:MM, N users, load averages: ..."
-uptime_raw=$(uptime)
-if echo "$uptime_raw" | grep -q "day"; then
-    days=$(echo "$uptime_raw" | sed -E 's/.*up ([0-9]+) day.*/\1/')
-    hours=$(echo "$uptime_raw" | sed -E 's/.*day[s]?, +([0-9]+):([0-9]+).*/\1/')
-    mins=$(echo "$uptime_raw" | sed -E 's/.*day[s]?, +([0-9]+):([0-9]+).*/\2/')
-    sys_uptime="${days}d ${hours}h ${mins}m"
-else
-    # No days, just hours:mins or mins
-    if echo "$uptime_raw" | grep -qE 'up +[0-9]+:[0-9]+'; then
-        hours=$(echo "$uptime_raw" | sed -E 's/.*up +([0-9]+):([0-9]+).*/\1/')
-        mins=$(echo "$uptime_raw" | sed -E 's/.*up +([0-9]+):([0-9]+).*/\2/')
-        sys_uptime="${hours}h ${mins}m"
-    elif echo "$uptime_raw" | grep -qE 'up +[0-9]+ min'; then
-        mins=$(echo "$uptime_raw" | sed -E 's/.*up +([0-9]+) min.*/\1/')
-        sys_uptime="${mins}m"
-    else
-        sys_uptime=$(echo "$uptime_raw" | sed -E 's/.*up +([^,]+),.*/\1/')
-    fi
+    sys_uptime=$(uptime -p | sed 's/up\s*//; s/\s*day\(s*\)/d/; s/\s*hour\(s*\)/h/; s/\s*minute\(s*\)/m/')
 fi
 
 # Set current length before graphs get calculated
